@@ -1,73 +1,135 @@
 # main.py
-import time
+import gc
+
 import machine
+import network
+import urequests
+import utime as time
 
-time.sleep(3)
-print("Starting!")
+# Constants
+SSID = "name"
+PASSWORD = "password"
+WATER_PIN = 36
+BATTERY_PIN = 35
+BEEPER_PIN = 12
+URL = "http://192.168.5.131/cm?cmnd=Power"
 
-waterpin = machine.ADC(machine.Pin(36))
-batterypin = machine.ADC(machine.Pin(35, machine.Pin.IN, machine.Pin.PULL_DOWN))
-batterypin.atten(machine.ADC.ATTN_11DB)
+
+# Setup ADC
+def setup_adc(pin_number, attenuation):
+    adc_pin = machine.ADC(
+        machine.Pin(pin_number, machine.Pin.IN, machine.Pin.PULL_DOWN)
+    )
+    adc_pin.atten(attenuation)
+    return adc_pin
 
 
-def make_sound(timeOn):
-    beeper = machine.PWM(machine.Pin(12, machine.Pin.OUT), freq=1000, duty=512)
-    time.sleep(timeOn)
+waterpin = setup_adc(WATER_PIN, machine.ADC.ATTN_11DB)
+batterypin = setup_adc(BATTERY_PIN, machine.ADC.ATTN_11DB)
+
+
+# Beeper setup
+def make_sound(time_on):
+    beeper = machine.PWM(machine.Pin(BEEPER_PIN, machine.Pin.OUT), freq=1000, duty=512)
+    time.sleep(time_on)
     beeper.deinit()
 
-batteryArray = []
-def isBatteryEmpty():
-    battery = batterypin.read()
 
-    # KEEP TRACK OF MULTIPLE VALUES AND TRIGGER IF MANY IN DESCENDING ORDER ARE FOUND
-    # if len(batteryArray) < 5:
-    #     batteryArray.append(battery)
-    #     return
-    
-    
-    # batteryArray[0:-1] = batteryArray[1:]
-    # batteryArray[len(batteryArray)-1] = battery
-    # print(batteryArray)
-    if battery < 2000:
-        return True
-    
-
-    # if battery > 5000:
-    #     return False
-
-    # # Check if numbers are all decreasing
-    # for i in range(0, len(batteryArray) - 1):
-    #     if batteryArray[i] >= batteryArray[i + 1]:
-    #         return False
-    
-    # print("Battery empty!")
-    # return True
+def make_repeated_sound(time_on, time_off, times):
+    for i in range(times):
+        make_sound(time_on)
+        time.sleep(time_off)
 
 
+# WiFi connection
+def connect_to_wifi(ssid, password):
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    wlan.connect(ssid, password)
+    print("Connecting to WiFi", end="")
+    while not wlan.isconnected():
+        print(".", end="")
+        time.sleep(1)
+    print("\nConnected to WiFi")
+    config = wlan.ifconfig()
+    print("Network config:", config)
+    # Log the RSSI (signal strength)
+    rssi = wlan.status("rssi")
+    print(f"WiFi signal strength: {rssi} dBm")
 
-make_sound(0.1)
-time.sleep(0.1)
-make_sound(0.1)
 
-counter = 0
-timeSleeping = 1
-while 1:
-    time.sleep(timeSleeping)
-    if isBatteryEmpty():
-        print("Battery empty!")
+# Smart switch control
+def smart_switch_available(url, retry_count=3):
+    wlan = network.WLAN(network.STA_IF)  # Get the network interface
+    for attempt in range(retry_count):
+        try:
+            response = urequests.get(url)
+            status_code = response.status_code
+            response.close()
+            if status_code == 200:
+                return True
+            else:
+                print(f"Attempt {attempt + 1} failed with status code: {status_code}")
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed: {e}")
+            print(f"Current network config: {wlan.ifconfig()}")
+            rssi = wlan.status("rssi")
+            print(f"Current WiFi signal strength: {rssi} dBm")
+            if attempt < retry_count - 1:
+                print("Retrying...")
+                time.sleep(2)  # wait 2 seconds before retrying
+            else:
+                print("Failed after several attempts.")
+    return False
+
+
+def set_airco_state(url, state):
+    try:
+        urequests.get(f"{url}%20{state}")
+        print(f"Airco state set to {state}")
+    except Exception as e:
+        print(f"Error setting Airco state: {e}")
+
+
+# Sensor readings
+def read_average_adc(adc_pin, samples=5):
+    total = sum(adc_pin.read() for _ in range(samples))
+    return total / samples
+
+
+# Main loop
+connect_to_wifi(SSID, PASSWORD)
+
+if not smart_switch_available(URL):
+    print("Airco smart switch not available")
+    make_repeated_sound(3, 1, 3)
+    exit(1)
+
+set_airco_state(URL, "On")
+make_repeated_sound(0.1, 0.1, 2)
+
+count = 0
+while True:
+    count += 1
+    print(f"Count: {count}")
+    gc.collect()
+    if not smart_switch_available(URL):
+        print("Airco smart switch not available")
         make_sound(5)
+        continue
 
-    level = 0
-    for i in range(5):
-        level += 0.2 * waterpin.read()
-    if level < 3000:
-        timeSleeping = 1
-        for i in range(5):
-            make_sound(0.1)
-            time.sleep(0.1)
+    battery_level = read_average_adc(batterypin)
+    water_level = read_average_adc(waterpin)
+    print(f"Water level: {water_level}, Battery level: {battery_level}")
+
+    if battery_level < 2000:
+        print("Battery empty!")
+        make_repeated_sound(1, 1, 5)
+        set_airco_state(URL, "Off")
+    elif water_level < 3000:
+        print("Water detected!")
+        set_airco_state(URL, "Off")
     else:
-        timeSleeping = 30
-    batterylevel = batterypin.read()
-    print(f"Loop: {counter}, Waterlevel: {level}, Battery: {batterylevel}")
-    counter += 1
-    
+        set_airco_state(URL, "On")
+
+    time.sleep(3)
